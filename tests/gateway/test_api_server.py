@@ -443,13 +443,19 @@ class TestHealthDetailedEndpoint:
                 assert data["platforms"] == {}
 
     @pytest.mark.asyncio
-    async def test_health_detailed_does_not_require_auth(self, auth_adapter):
-        """Health detailed endpoint should be accessible without auth, like /health."""
+    async def test_health_detailed_requires_auth_when_configured(self, auth_adapter):
+        """Detailed runtime metadata must use the API bearer key."""
         app = _create_app(auth_adapter)
         with patch("gateway.status.read_runtime_status", return_value=None):
             async with TestClient(TestServer(app)) as cli:
-                resp = await cli.get("/health/detailed")
-                assert resp.status == 200
+                unauthorized = await cli.get("/health/detailed")
+                assert unauthorized.status == 401
+
+                authorized = await cli.get(
+                    "/health/detailed",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert authorized.status == 200
 
 
 # ---------------------------------------------------------------------------
