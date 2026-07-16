@@ -4475,6 +4475,26 @@ class APIServerAdapter(BasePlatformAdapter):
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                     )
+                    final_response = str(result.get("final_response") or "")
+                    if "MEDIA:" not in final_response:
+                        from gateway.run import (
+                            _collect_auto_append_media_tags,
+                            _collect_history_media_paths,
+                        )
+
+                        media_tags, has_voice_directive = _collect_auto_append_media_tags(
+                            result.get("messages", []),
+                            history_offset=len(conversation_history),
+                            history_media_paths=_collect_history_media_paths(conversation_history),
+                        )
+                        unique_tags = list(dict.fromkeys(media_tags))
+                        if has_voice_directive:
+                            unique_tags.insert(0, "[[audio_as_voice]]")
+                        if unique_tags:
+                            separator = "\n" if final_response else ""
+                            result["final_response"] = separator.join(
+                                (final_response, "\n".join(unique_tags))
+                            )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
