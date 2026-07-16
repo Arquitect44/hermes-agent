@@ -1269,7 +1269,11 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def validate_media_delivery_path(path: str) -> Optional[str]:
+def validate_media_delivery_path(
+    path: str,
+    *,
+    force_strict: bool = False,
+) -> Optional[str]:
     """Return a safe absolute file path for native media delivery, else None.
 
     Default mode (single-user / private gateway): accept any existing regular
@@ -1279,8 +1283,8 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     will hand the agent any file the user uploads, and the agent can hand
     back any file that isn't a credential.
 
-    Strict mode (opt-in via ``gateway.strict`` in ``config.yaml`` or
-    ``HERMES_MEDIA_DELIVERY_STRICT=1``): the file MUST live under a
+    Strict mode (opt-in via ``gateway.strict`` in ``config.yaml``,
+    ``HERMES_MEDIA_DELIVERY_STRICT=1``, or ``force_strict=True``): the file MUST live under a
     Hermes-managed cache, under an operator-allowlisted root
     (``HERMES_MEDIA_ALLOW_DIRS``), or be freshly produced inside the
     configured recency window. Suitable for public-facing bots where
@@ -1332,7 +1336,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # so the obvious prompt-injection / credential-exfil sites
     # (``MEDIA:/etc/passwd``, ``MEDIA:~/.ssh/id_rsa``,
     # ``MEDIA:~/.hermes/google_token.json``) remain rejected.
-    if not _media_delivery_strict_mode():
+    if not force_strict and not _media_delivery_strict_mode():
         if _path_under_denied_prefix(resolved):
             return None
         return str(resolved)

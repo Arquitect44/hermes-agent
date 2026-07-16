@@ -1,6 +1,7 @@
 """Regression coverage for generated media returned through the API server."""
 
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -76,5 +77,16 @@ def test_responses_refuse_unsafe_media_paths() -> None:
     attachments = adapter._register_response_media(
         "MEDIA:/home/marquise/.hermes/profiles/symcrg/.env"
     )
+
+    assert attachments == []
+
+
+def test_responses_refuse_stale_host_files(tmp_path) -> None:
+    stale_file = tmp_path / "existing-notes.txt"
+    stale_file.write_text("private host notes", encoding="utf-8")
+    os.utime(stale_file, (1, 1))
+    adapter = APIServerAdapter(PlatformConfig())
+
+    attachments = adapter._register_response_media(f"MEDIA:{stale_file}")
 
     assert attachments == []

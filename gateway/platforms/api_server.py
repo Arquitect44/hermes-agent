@@ -1849,7 +1849,10 @@ class APIServerAdapter(BasePlatformAdapter):
         attachments: List[Dict[str, str]] = []
         seen_paths: set[str] = set()
         for match in MEDIA_TAG_CLEANUP_RE.finditer(response_text or ""):
-            safe_path = validate_media_delivery_path(match.group("path"))
+            safe_path = validate_media_delivery_path(
+                match.group("path"),
+                force_strict=True,
+            )
             if not safe_path or safe_path in seen_paths:
                 continue
             path = Path(safe_path)
@@ -1892,7 +1895,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not item or item[1] <= time.time():
             self._response_media.pop(media_id, None)
             raise web.HTTPNotFound()
-        safe_path = validate_media_delivery_path(item[0])
+        safe_path = validate_media_delivery_path(item[0], force_strict=True)
         if not safe_path:
             self._response_media.pop(media_id, None)
             raise web.HTTPNotFound()
