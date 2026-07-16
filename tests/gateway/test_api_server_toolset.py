@@ -69,8 +69,35 @@ class TestApiServerPlatformConfig:
 
 class TestApiServerAdapterToolset:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
-    def test_create_agent_reads_config_toolsets(self):
-        """API server resolves toolsets from config like all other platforms."""
+    def test_create_agent_scopes_external_memory_to_api_session(self):
+        """The API session identity must reach external memory providers."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
+             patch("gateway.run._resolve_gateway_model", return_value="test/model"), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_kwargs.return_value = {
+                "api_key": "test-key",
+                "base_url": None,
+                "provider": None,
+                "api_mode": None,
+                "command": None,
+                "args": [],
+            }
+
+            adapter._create_agent(session_id="symcrg-profile-42")
+
+            call_kwargs = mock_agent_cls.call_args.kwargs
+            assert call_kwargs["user_id"] == "symcrg-profile-42"
+            assert call_kwargs["gateway_session_key"] == "symcrg-profile-42"
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_create_agent_fails_closed_without_explicit_toolsets(self):
+        """API server exposes no tools when its platform config is absent."""
         from gateway.platforms.api_server import APIServerAdapter
         from gateway.config import PlatformConfig
 
@@ -85,7 +112,6 @@ class TestApiServerAdapterToolset:
                                         "provider": None, "api_mode": None,
                                         "command": None, "args": []}
             mock_model.return_value = "test/model"
-            # No platform_toolsets override — should fall back to hermes-api-server default
             mock_config.return_value = {}
             mock_agent_cls.return_value = MagicMock()
 
@@ -95,7 +121,7 @@ class TestApiServerAdapterToolset:
             call_kwargs = mock_agent_cls.call_args
             toolsets = call_kwargs.kwargs.get("enabled_toolsets")
             assert isinstance(toolsets, list)
-            assert len(toolsets) > 0
+            assert toolsets == []
             assert call_kwargs.kwargs.get("platform") == "api_server"
 
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)

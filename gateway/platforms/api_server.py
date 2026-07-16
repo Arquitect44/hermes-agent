@@ -34,6 +34,7 @@ import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -60,6 +61,11 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+GENERATED_IMAGE_FILENAME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.(?:jpe?g|png|webp)$",
+    re.IGNORECASE,
+)
+GENERATED_IMAGE_MAX_BYTES = 16 * 1024 * 1024
 
 
 def _normalize_chat_content(
@@ -734,7 +740,17 @@ class APIServerAdapter(BasePlatformAdapter):
         model = _resolve_gateway_model()
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        platform_toolsets = user_config.get("platform_toolsets")
+        configured_toolsets = (
+            platform_toolsets.get("api_server")
+            if isinstance(platform_toolsets, dict)
+            else None
+        )
+        enabled_toolsets = (
+            sorted(_get_platform_tools(user_config, "api_server"))
+            if isinstance(configured_toolsets, list)
+            else []
+        )
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -753,6 +769,8 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
+            user_id=session_id,
+            gateway_session_key=session_id,
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
@@ -816,6 +834,36 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
 
+    async def _handle_generated_image(self, request: "web.Request") -> "web.Response":
+        """Serve one authenticated image from the profile's generated-image cache."""
+        if not self._api_key:
+            return web.json_response(
+                {"error": {"message": "Generated image access is not configured"}},
+                status=503,
+            )
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        filename = request.match_info.get("filename", "")
+        if not GENERATED_IMAGE_FILENAME_RE.fullmatch(filename):
+            raise web.HTTPNotFound()
+
+        from hermes_constants import get_hermes_home
+
+        image_dir = (get_hermes_home() / "cache" / "images").resolve()
+        image_path = (image_dir / filename).resolve()
+        if image_path.parent != image_dir or not image_path.is_file():
+            raise web.HTTPNotFound()
+        image_size = image_path.stat().st_size
+        if image_size == 0 or image_size > GENERATED_IMAGE_MAX_BYTES:
+            raise web.HTTPNotFound()
+
+        return web.FileResponse(
+            path=Path(image_path),
+            headers={"Cache-Control": "private, max-age=600, immutable"},
+        )
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -854,6 +902,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
+                "generated_image": {"method": "GET", "path": "/v1/images/{filename}"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -870,7 +919,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Parse request body
         try:
             body = await request.json()
-        except (json.JSONDecodeError, Exception):
+        except web.HTTPRequestEntityTooLarge:
+            raise
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
         messages = body.get("messages")
@@ -1758,7 +1809,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Parse request body
         try:
             body = await request.json()
-        except (json.JSONDecodeError, Exception):
+        except web.HTTPRequestEntityTooLarge:
+            raise
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return web.json_response(
                 {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
                 status=400,
@@ -2132,6 +2185,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
+        except web.HTTPRequestEntityTooLarge:
+            raise
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
@@ -2184,6 +2239,8 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
+        except web.HTTPRequestEntityTooLarge:
+            raise
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
@@ -2454,7 +2511,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             body = await request.json()
-        except Exception:
+        except web.HTTPRequestEntityTooLarge:
+            raise
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         raw_input = body.get("input")
@@ -2779,7 +2838,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
-            self._app = web.Application(middlewares=mws)
+            self._app = web.Application(
+                middlewares=mws,
+                client_max_size=MAX_REQUEST_BYTES,
+            )
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
@@ -2790,6 +2852,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            self._app.router.add_get("/v1/images/{filename}", self._handle_generated_image)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
