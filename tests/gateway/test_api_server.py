@@ -631,6 +631,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_get("/v1/images/{filename}", adapter._handle_generated_image)
     return app
 
 
@@ -642,6 +643,72 @@ def adapter():
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")
+
+
+class TestGeneratedImages:
+    @pytest.mark.asyncio
+    async def test_fails_closed_when_image_auth_is_not_configured(self, adapter):
+        async with TestClient(TestServer(_create_app(adapter))) as client:
+            response = await client.get("/v1/images/gemini_example.jpeg")
+
+        assert response.status == 503
+
+    @pytest.mark.asyncio
+    async def test_serves_cached_image_with_bearer_auth(self, auth_adapter, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        image_dir = tmp_path / "cache" / "images"
+        image_dir.mkdir(parents=True)
+        image = image_dir / "gemini_example.jpeg"
+        image.write_bytes(b"jpeg-data")
+
+        async with TestClient(TestServer(_create_app(auth_adapter))) as client:
+            response = await client.get(
+                "/v1/images/gemini_example.jpeg",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            response_body = await response.read()
+
+        assert response.status == 200
+        assert response.headers["Content-Type"] == "image/jpeg"
+        assert response_body == b"jpeg-data"
+
+    @pytest.mark.asyncio
+    async def test_rejects_unauthenticated_and_invalid_image_paths(self, auth_adapter, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "cache" / "images").mkdir(parents=True)
+
+        async with TestClient(TestServer(_create_app(auth_adapter))) as client:
+            unauthenticated = await client.get("/v1/images/gemini_example.jpeg")
+            invalid = await client.get(
+                "/v1/images/not-an-image.txt",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            traversal = await client.get(
+                "/v1/images/%2e%2e%2fconfig.yaml",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+
+        assert unauthenticated.status == 401
+        assert invalid.status == 404
+        assert traversal.status == 404
+
+    @pytest.mark.asyncio
+    async def test_rejects_oversized_cached_images(self, auth_adapter, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        image_dir = tmp_path / "cache" / "images"
+        image_dir.mkdir(parents=True)
+        oversized = image_dir / "gemini_oversized.jpeg"
+        oversized.write_bytes(b"x")
+        with oversized.open("r+b") as image_file:
+            image_file.truncate(16 * 1024 * 1024 + 1)
+
+        async with TestClient(TestServer(_create_app(auth_adapter))) as client:
+            response = await client.get(
+                "/v1/images/gemini_oversized.jpeg",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+
+        assert response.status == 404
 
 
 # ---------------------------------------------------------------------------

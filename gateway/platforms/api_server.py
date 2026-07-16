@@ -124,6 +124,11 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+GENERATED_IMAGE_FILENAME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.(?:jpe?g|png|webp)$",
+    re.IGNORECASE,
+)
+GENERATED_IMAGE_MAX_BYTES = 16 * 1024 * 1024
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1338,6 +1343,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
+            ("GET", "/v1/images/{filename}", self._handle_generated_image),
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
@@ -1641,7 +1647,17 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        platform_toolsets = user_config.get("platform_toolsets")
+        configured_toolsets = (
+            platform_toolsets.get("api_server")
+            if isinstance(platform_toolsets, dict)
+            else None
+        )
+        enabled_toolsets = (
+            sorted(_get_platform_tools(user_config, "api_server"))
+            if isinstance(configured_toolsets, list)
+            else []
+        )
 
         max_iterations = _current_max_iterations()
 
@@ -1659,6 +1675,8 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
+            user_id=gateway_session_key or session_id,
+            gateway_session_key=gateway_session_key or session_id,
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
@@ -1666,7 +1684,6 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
-            gateway_session_key=gateway_session_key,
         )
         return agent
 
@@ -1784,6 +1801,36 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"object": "list", "data": models})
 
+    async def _handle_generated_image(self, request: "web.Request") -> "web.Response":
+        """Serve one authenticated image from the profile's generated-image cache."""
+        if not self._api_key:
+            return web.json_response(
+                {"error": {"message": "Generated image access is not configured"}},
+                status=503,
+            )
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        filename = request.match_info.get("filename", "")
+        if not GENERATED_IMAGE_FILENAME_RE.fullmatch(filename):
+            raise web.HTTPNotFound()
+
+        from hermes_constants import get_hermes_home
+
+        image_dir = (get_hermes_home() / "cache" / "images").resolve()
+        image_path = (image_dir / filename).resolve()
+        if image_path.parent != image_dir or not image_path.is_file():
+            raise web.HTTPNotFound()
+        image_size = image_path.stat().st_size
+        if image_size == 0 or image_size > GENERATED_IMAGE_MAX_BYTES:
+            raise web.HTTPNotFound()
+
+        return web.FileResponse(
+            path=Path(image_path),
+            headers={"Cache-Control": "private, max-age=600, immutable"},
+        )
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -1845,6 +1892,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
+                "generated_image": {"method": "GET", "path": "/v1/images/{filename}"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -2395,7 +2443,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Parse request body
         try:
             body = await request.json()
-        except (json.JSONDecodeError, Exception):
+        except web.HTTPRequestEntityTooLarge:
+            raise
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
 
         messages = body.get("messages")
@@ -3533,7 +3583,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Parse request body
         try:
             body = await request.json()
-        except (json.JSONDecodeError, Exception):
+        except web.HTTPRequestEntityTooLarge:
+            raise
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return web.json_response(
                 {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
                 status=400,
@@ -3937,6 +3989,8 @@ class APIServerAdapter(BasePlatformAdapter):
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except web.HTTPRequestEntityTooLarge:
+            raise
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -3994,6 +4048,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except web.HTTPRequestEntityTooLarge:
+            raise
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -4525,7 +4581,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             body = await request.json()
-        except Exception:
+        except web.HTTPRequestEntityTooLarge:
+            raise
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         raw_input = body.get("input")
@@ -5148,7 +5206,6 @@ class APIServerAdapter(BasePlatformAdapter):
             # native routes first lets those shims no-op instead of shadowing the
             # upstream session-control handlers.
             self._app["api_server_adapter"] = self
-
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
