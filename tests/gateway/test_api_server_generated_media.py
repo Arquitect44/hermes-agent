@@ -47,3 +47,34 @@ async def test_run_agent_appends_generated_image_when_model_omits_path() -> None
         "[Image generated: blue office building]\n"
         f"MEDIA:{image_path}"
     )
+
+
+@pytest.mark.asyncio
+async def test_responses_register_document_for_authenticated_delivery(tmp_path) -> None:
+    document = tmp_path / "broker-package.pdf"
+    document.write_bytes(b"%PDF-1.7\nSYMCRG")
+    adapter = APIServerAdapter(PlatformConfig())
+
+    attachments = adapter._register_response_media(
+        f"Your package is ready.\nMEDIA:{document}"
+    )
+
+    assert len(attachments) == 1
+    assert attachments[0]["filename"] == "broker-package.pdf"
+    assert attachments[0]["content_type"] == "application/pdf"
+    request = MagicMock()
+    request.match_info = {"media_id": attachments[0]["id"]}
+    request.headers = {}
+    response = await adapter._handle_response_media(request)
+    assert response.status == 200
+    assert response._path == document
+
+
+def test_responses_refuse_unsafe_media_paths() -> None:
+    adapter = APIServerAdapter(PlatformConfig())
+
+    attachments = adapter._register_response_media(
+        "MEDIA:/home/marquise/.hermes/profiles/symcrg/.env"
+    )
+
+    assert attachments == []

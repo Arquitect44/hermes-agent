@@ -47,6 +47,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
 import logging
+import mimetypes
 import os
 import re
 import sqlite3
@@ -618,6 +619,10 @@ _MEDIA_MIME = {
     ".bmp": "image/bmp",
 }
 _MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
+_RESPONSE_MEDIA_TTL_SECONDS = 10 * 60
+_RESPONSE_MEDIA_MAX_ITEMS = 256
+_RESPONSE_MEDIA_MAX_BYTES = 16 * 1024 * 1024
+_RESPONSE_MEDIA_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 
 def _resolve_media_to_data_urls(text: str) -> str:
@@ -971,6 +976,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        self._response_media: Dict[str, tuple[str, float]] = {}
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1344,6 +1350,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
             ("GET", "/v1/images/{filename}", self._handle_generated_image),
+            ("GET", "/v1/media/{media_id}", self._handle_response_media),
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
@@ -1829,6 +1836,72 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.FileResponse(
             path=Path(image_path),
             headers={"Cache-Control": "private, max-age=600, immutable"},
+        )
+
+    def _register_response_media(self, response_text: str) -> List[Dict[str, str]]:
+        """Register current-turn MEDIA files behind short-lived opaque IDs."""
+        now = time.time()
+        self._response_media = {
+            media_id: item
+            for media_id, item in self._response_media.items()
+            if item[1] > now
+        }
+        attachments: List[Dict[str, str]] = []
+        seen_paths: set[str] = set()
+        for match in MEDIA_TAG_CLEANUP_RE.finditer(response_text or ""):
+            safe_path = validate_media_delivery_path(match.group("path"))
+            if not safe_path or safe_path in seen_paths:
+                continue
+            path = Path(safe_path)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size <= 0 or size > _RESPONSE_MEDIA_MAX_BYTES:
+                continue
+            seen_paths.add(safe_path)
+            media_id = uuid.uuid4().hex
+            self._response_media[media_id] = (
+                safe_path,
+                now + _RESPONSE_MEDIA_TTL_SECONDS,
+            )
+            content_type = (
+                mimetypes.guess_type(path.name)[0]
+                or "application/octet-stream"
+            )
+            attachments.append({
+                "id": media_id,
+                "filename": path.name,
+                "content_type": content_type,
+            })
+
+        while len(self._response_media) > _RESPONSE_MEDIA_MAX_ITEMS:
+            oldest_id = next(iter(self._response_media))
+            self._response_media.pop(oldest_id, None)
+        return attachments
+
+    async def _handle_response_media(self, request: "web.Request") -> "web.Response":
+        """Serve one authenticated, short-lived response attachment."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        media_id = str(request.match_info.get("media_id", ""))
+        if not _RESPONSE_MEDIA_ID_RE.fullmatch(media_id):
+            raise web.HTTPNotFound()
+        item = self._response_media.get(media_id)
+        if not item or item[1] <= time.time():
+            self._response_media.pop(media_id, None)
+            raise web.HTTPNotFound()
+        safe_path = validate_media_delivery_path(item[0])
+        if not safe_path:
+            self._response_media.pop(media_id, None)
+            raise web.HTTPNotFound()
+        return web.FileResponse(
+            path=Path(safe_path),
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
@@ -3798,7 +3871,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        raw_final_response = str(result.get("final_response", ""))
+        attachments = self._register_response_media(raw_final_response)
+        final_response = _resolve_media_to_data_urls(raw_final_response)
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
 
@@ -3837,6 +3912,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        if attachments:
+            response_data["attachments"] = attachments
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
