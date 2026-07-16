@@ -37,6 +37,8 @@ Optional / Phase-3+:
 - WHATSAPP_CLOUD_WEBHOOK_PORT     (default 8090)
 - WHATSAPP_CLOUD_WEBHOOK_PATH     (default /whatsapp/webhook)
 - WHATSAPP_CLOUD_API_VERSION      (default v20.0)
+- WHATSAPP_CLOUD_TWILIO_ACCOUNT_SID (Twilio-managed sender outbound auth)
+- WHATSAPP_CLOUD_TWILIO_AUTH_TOKEN  (Twilio-managed sender outbound auth)
 """
 
 from __future__ import annotations
@@ -90,6 +92,7 @@ DEFAULT_WEBHOOK_HOST = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8090
 DEFAULT_WEBHOOK_PATH = "/whatsapp/webhook"
 GRAPH_API_BASE = "https://graph.facebook.com"
+TWILIO_API_BASE = "https://api.twilio.com/2010-04-01"
 WEBHOOK_MAX_BODY_BYTES = 3 * 1024 * 1024
 # Meta retries failed webhooks for up to 7 days. We don't need to remember
 # every wamid for the full retry window — the practical risk is duplicate
@@ -228,6 +231,20 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         # Graph API
         self._api_version: str = str(extra.get("api_version", DEFAULT_API_VERSION))
+
+        # A Twilio-hosted WhatsApp sender still receives Meta webhooks, but
+        # outbound messages must use Twilio's Messages API. The provider and
+        # sender are behavioral config; credentials remain profile secrets.
+        self._outbound_provider: str = str(
+            extra.get("outbound_provider", "meta")
+        ).strip().lower()
+        self._twilio_account_sid: str = str(
+            extra.get("twilio_account_sid", "")
+        ).strip()
+        self._twilio_auth_token: str = str(
+            extra.get("twilio_auth_token", "")
+        ).strip()
+        self._twilio_from: str = str(extra.get("twilio_from", "")).strip()
 
         # Behavior-mixin contract: these names are read by the mixin's
         # gating methods. WHATSAPP_CLOUD_* env vars take precedence so the
@@ -419,6 +436,19 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 retryable=False,
             )
             return False
+        if self._outbound_provider == "twilio" and not all(
+            (
+                self._twilio_account_sid,
+                self._twilio_auth_token,
+                self._twilio_from,
+            )
+        ):
+            self._set_fatal_error(
+                "whatsapp_cloud_twilio_unconfigured",
+                "Twilio outbound requires account SID, auth token, and sender.",
+                retryable=False,
+            )
+            return False
 
         # Outbound HTTP client. Tighter keepalive matches other platform
         # adapters so idle CLOSE_WAIT drains promptly (#18451).
@@ -500,6 +530,9 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self._outgoing_chunk_limit())
 
+        if self._outbound_provider == "twilio":
+            return await self._send_text_twilio(chat_id, chunks, formatted)
+
         url = self._graph_url("messages")
         headers = {
             "Authorization": f"Bearer {self._access_token}",
@@ -556,6 +589,67 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if last_message_id:
             rich_sent_store.record(chat_id, last_message_id, formatted)
 
+        return SendResult(success=True, message_id=last_message_id)
+
+    async def _send_text_twilio(
+        self,
+        chat_id: str,
+        chunks: list[str],
+        formatted: str,
+    ) -> SendResult:
+        """Send text through Twilio for a Twilio-hosted WhatsApp sender."""
+        url = (
+            f"{TWILIO_API_BASE}/Accounts/"
+            f"{self._twilio_account_sid}/Messages.json"
+        )
+        sender = self._twilio_from.removeprefix("whatsapp:")
+        recipient = chat_id.removeprefix("whatsapp:")
+        sender = f"+{sender.lstrip('+')}"
+        recipient = f"+{recipient.lstrip('+')}"
+        auth = httpx.BasicAuth(
+            self._twilio_account_sid,
+            self._twilio_auth_token,
+        )
+
+        last_message_id: Optional[str] = None
+        for chunk in chunks:
+            payload = {
+                "From": f"whatsapp:{sender}",
+                "To": f"whatsapp:{recipient}",
+                "Body": chunk,
+            }
+            try:
+                resp = await self._http_client.post(
+                    url,
+                    data=payload,
+                    auth=auth,
+                )
+            except Exception as exc:
+                logger.exception("[whatsapp_cloud] Twilio send failed")
+                return SendResult(success=False, error=str(exc))
+
+            if not 200 <= resp.status_code < 300:
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = {"message": resp.text[:500]}
+                code = body.get("code", "unknown")
+                message = body.get("message", "unknown error")
+                error_msg = f"twilio error {code}: {message}"
+                logger.warning(
+                    "[whatsapp_cloud] Twilio send rejected (status=%d): %s",
+                    resp.status_code,
+                    error_msg,
+                )
+                return SendResult(success=False, error=error_msg)
+
+            try:
+                last_message_id = resp.json().get("sid") or last_message_id
+            except Exception:
+                pass
+
+        if last_message_id:
+            rich_sent_store.record(chat_id, last_message_id, formatted)
         return SendResult(success=True, message_id=last_message_id)
 
     # ------------------------------------------------------------------ typing indicator + read receipts

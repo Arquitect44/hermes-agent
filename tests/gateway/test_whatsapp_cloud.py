@@ -63,6 +63,10 @@ def _make_adapter(**overrides):
     adapter._webhook_path = "/whatsapp/webhook"
     adapter._health_path = "/health"
     adapter._api_version = overrides.pop("api_version", "v20.0")
+    adapter._outbound_provider = overrides.pop("outbound_provider", "meta")
+    adapter._twilio_account_sid = overrides.pop("twilio_account_sid", "")
+    adapter._twilio_auth_token = overrides.pop("twilio_auth_token", "")
+    adapter._twilio_from = overrides.pop("twilio_from", "")
     adapter._runner = None
     adapter._http_client = None
 
@@ -309,6 +313,57 @@ class TestSendText:
         result = await adapter.send("15551234567", "hi")
         assert result.success is False
         assert "boom" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_uses_twilio_for_bsp_managed_sender(self):
+        adapter = _make_adapter(
+            outbound_provider="twilio",
+            twilio_account_sid="AC123",
+            twilio_auth_token="auth-secret",
+            twilio_from="+18664891282",
+        )
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(
+                201, {"sid": "SM123", "status": "queued"}
+            )
+        )
+
+        result = await adapter.send("12036733908", "**hello**")
+
+        call = adapter._http_client.post.call_args
+        assert call.args[0] == (
+            "https://api.twilio.com/2010-04-01/Accounts/AC123/Messages.json"
+        )
+        assert call.kwargs["data"] == {
+            "From": "whatsapp:+18664891282",
+            "To": "whatsapp:+12036733908",
+            "Body": "*hello*",
+        }
+        assert call.kwargs["auth"]._auth_header == "Basic QUMxMjM6YXV0aC1zZWNyZXQ="
+        assert result.success is True
+        assert result.message_id == "SM123"
+
+    @pytest.mark.asyncio
+    async def test_send_surfaces_twilio_rejection(self):
+        adapter = _make_adapter(
+            outbound_provider="twilio",
+            twilio_account_sid="AC123",
+            twilio_auth_token="auth-secret",
+            twilio_from="+18664891282",
+        )
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(
+                400, {"code": 21211, "message": "Invalid To Phone Number"}
+            )
+        )
+
+        result = await adapter.send("not-a-number", "hello")
+
+        assert result.success is False
+        assert "twilio error 21211" in result.error
+        assert "Invalid To Phone Number" in result.error
 
 
 # ---------------------------------------------------------------------------

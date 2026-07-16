@@ -1621,6 +1621,19 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         wa_cloud_api_version = getenv("WHATSAPP_CLOUD_API_VERSION")
         if wa_cloud_api_version:
             config.platforms[Platform.WHATSAPP_CLOUD].extra["api_version"] = wa_cloud_api_version
+        # Twilio-hosted WhatsApp senders receive through Meta webhooks but
+        # authenticate outbound sends with Twilio. Only credentials live in
+        # the profile secret scope; provider selection stays in config.yaml.
+        wa_cloud_twilio_sid = getenv("WHATSAPP_CLOUD_TWILIO_ACCOUNT_SID")
+        if wa_cloud_twilio_sid:
+            config.platforms[Platform.WHATSAPP_CLOUD].extra[
+                "twilio_account_sid"
+            ] = wa_cloud_twilio_sid
+        wa_cloud_twilio_token = getenv("WHATSAPP_CLOUD_TWILIO_AUTH_TOKEN")
+        if wa_cloud_twilio_token:
+            config.platforms[Platform.WHATSAPP_CLOUD].extra[
+                "twilio_auth_token"
+            ] = wa_cloud_twilio_token
     whatsapp_cloud_home = getenv("WHATSAPP_CLOUD_HOME_CHANNEL")
     if whatsapp_cloud_home and Platform.WHATSAPP_CLOUD in config.platforms:
         config.platforms[Platform.WHATSAPP_CLOUD].home_channel = HomeChannel(
