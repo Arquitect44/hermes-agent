@@ -1,16 +1,18 @@
 import { useStore } from '@nanostores/react'
 import { type ComponentProps, type MouseEvent, type ReactNode, useEffect, useState } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router'
 
+import { hudTargetSessionId } from '@/app/hud/handoff'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
 import { resetLayoutTree } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import { Tip } from '@/components/ui/tooltip'
+import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
 import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
+import { toggleHud } from '@/store/hud'
 import {
   $fileBrowserOpen,
   $sidebarOpen,
@@ -33,6 +35,8 @@ export interface TitlebarTool {
   href?: string
   icon: ReactNode
   onSelect?: (event?: MouseEvent) => void
+  /** Keybind action id — when set, the tooltip shows the label + keybind hint. */
+  actionId?: string
   title?: string
   to?: string
 }
@@ -123,6 +127,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
 
   const leftToolbarTools: TitlebarTool[] = [
     {
+      actionId: 'view.toggleSidebar',
       icon: <Codicon name="layout-sidebar-left" />,
       id: 'sidebar',
       label: leftEdge.open ? t.titlebar.hideSidebar : t.titlebar.showSidebar,
@@ -132,19 +137,20 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
       }
     },
     {
+      actionId: 'view.flipPanes',
       icon: <Codicon name="arrow-swap" />,
       id: 'flip-panes',
       label: t.titlebar.swapSidebarSides,
       onSelect: () => {
         triggerHaptic('tap')
         togglePanesFlipped()
-      },
-      title: t.titlebar.swapSidebarSidesTitle
+      }
     },
     ...leftTools
   ]
 
   const rightSidebarTool: TitlebarTool = {
+    actionId: 'view.toggleRightSidebar',
     icon: <Codicon name="layout-sidebar-right" />,
     id: 'right-sidebar',
     label: rightEdge.open ? t.titlebar.hideRightSidebar : t.titlebar.showRightSidebar,
@@ -177,6 +183,20 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
       title: t.titlebar.layoutEditorTitle
     },
     {
+      // No `title`: TitlebarToolButton passes `title` to TipKeybindLabel as a
+      // text OVERRIDE, so a long sentence there replaces the short label and
+      // crowds the ⌘⇧H hint off the tooltip. Label only — the hint is appended
+      // from the action registry, same as every other tool here.
+      actionId: 'view.toggleHud',
+      icon: <Codicon name="comment-discussion" />,
+      id: 'hud',
+      label: t.titlebar.enterHud,
+      onSelect: () => {
+        triggerHaptic('open')
+        toggleHud(hudTargetSessionId())
+      }
+    },
+    {
       active: hapticsMuted,
       icon: <Codicon name={hapticsMuted ? 'mute' : 'unmute'} />,
       id: 'haptics',
@@ -184,6 +204,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
       onSelect: toggleHaptics
     },
     {
+      actionId: 'nav.settings',
       icon: <Codicon name="settings-gear" />,
       id: 'settings',
       label: t.titlebar.openSettings,
@@ -256,9 +277,15 @@ function TitlebarToolButton({ navigate, tool }: { navigate: ReturnType<typeof us
   // for a11y.
   const className = cn(titlebarButtonClass, 'bg-transparent select-none', tool.className)
 
+  const tooltipLabel = tool.actionId ? (
+    <TipKeybindLabel actionId={tool.actionId} text={tool.title ?? tool.label} />
+  ) : (
+    (tool.title ?? tool.label)
+  )
+
   if (tool.href) {
     return (
-      <Tip label={tool.title ?? tool.label}>
+      <Tip label={tooltipLabel}>
         <Button asChild className={className} size="icon-titlebar" variant="ghost">
           <a
             aria-label={tool.label}
@@ -275,7 +302,7 @@ function TitlebarToolButton({ navigate, tool }: { navigate: ReturnType<typeof us
   }
 
   return (
-    <Tip label={tool.title ?? tool.label}>
+    <Tip label={tooltipLabel}>
       <Button
         aria-label={tool.label}
         aria-pressed={tool.active ?? undefined}
